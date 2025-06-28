@@ -1,0 +1,541 @@
+#include <iostream>
+#include <string>
+#include <cstdlib>
+#include <ctime>
+#include <map>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <vector>
+#include <fstream>
+#include <chrono>
+#include <atomic>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
+#include <limits>
+#include <climits>
+#include <utility>    // for std::move
+
+#ifdef _WIN32
+#define CLEAR_COMMAND "cls"
+#else
+#define CLEAR_COMMAND "clear"
+#endif
+
+struct Instruction {
+    enum Type { PRINT, DECLARE, ADD, SUBTRACT, SLEEP, FOR } type;
+    std::vector<std::string> args;               // PRINT/DECLARE/ADD/SUB/SLEEP
+    std::vector<Instruction> body;               // FOR body
+    unsigned repeats = 0;                        // FOR repeat count
+
+    Instruction() = default;
+    Instruction(Type t,
+                std::vector<std::string> a,
+                std::vector<Instruction> b,
+                unsigned r)
+      : type(t), args(std::move(a)), body(std::move(b)), repeats(r)
+    {}
+};
+
+struct Process {
+    int id;
+    std::string name;
+    std::string startTime;
+    int totalCommands;
+    int executedCommands = 0;
+    int core = -1;
+    bool isFinished = false;
+
+    std::vector<Instruction> instructions;
+    std::map<std::string,uint16_t> varStore;
+    std::vector<std::string> logs;
+    std::mutex logMutex;
+
+    Process(int i, const std::string &t, const std::vector<Instruction> &insts)
+      : id(i), startTime(t), instructions(insts)
+    {
+        char buf[8];
+        std::snprintf(buf,sizeof(buf),"%02d",i+1);
+        name = "process"; name += buf;
+        totalCommands = (int)instructions.size();
+    }
+
+    void addLog(const std::string &L) {
+        std::lock_guard<std::mutex> g(logMutex);
+        logs.push_back(L);
+    }
+    std::vector<std::string> getLogs() {
+        std::lock_guard<std::mutex> g(logMutex);
+        return logs;
+    }
+};
+
+struct Config {
+    int num_cpu = 4;
+    std::string scheduler = "fcfs";
+    unsigned quantum_cycles = 1;
+    unsigned batch_process_freq = 1;
+    unsigned min_ins = 1;
+    unsigned max_ins = 100;
+    unsigned delays_per_exec = 0;
+};
+
+static Config config;
+static bool initialized = false;
+static std::queue<Process*> processQueue;
+static std::vector<Process*> allProcesses;
+static std::vector<Process*> finishedProcesses;
+static std::mutex queueMutex, allMutex, finishedMutex;
+static std::condition_variable cv;
+static std::atomic<bool> exitFlag{false}, schedulerStarted{false}, schedulerRunning{false};
+static std::vector<std::thread> workerThreads;
+static std::vector<bool> coreStatus;
+
+std::string getCurrentTime() {
+    auto now = std::chrono::system_clock::now();
+    auto t   = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm,&t);
+#else
+    localtime_r(&t,&tm);
+#endif
+    std::ostringstream ss;
+    ss << std::setfill('0')
+       << std::setw(2) << (tm.tm_mon+1) << "/"
+       << std::setw(2) << tm.tm_mday << "/"
+       << (tm.tm_year+1900) << " "
+       << ((tm.tm_hour%12)==0?12:(tm.tm_hour%12)) << ":"
+       << std::setw(2) << tm.tm_min << ":"
+       << std::setw(2) << tm.tm_sec
+       << (tm.tm_hour>=12?"PM":"AM");
+    return ss.str();
+}
+
+void printHeader(){
+    std::cout
+      << "\n"
+      << "  ****  ****    ***     *****   ******   ****    *     *\n"
+      << " *      *      *   *    *    *  *        *        *   * \n"
+      << "*       ****  *     *   *****   *****    ****      * *  \n"
+      << "*          *  *     *   *       *           *       *   \n"
+      << " *         *   *   *    *       *           *       *   \n"
+      << "  ****  ****    ***     *       ******   ****       *   \n"
+      << "\nCommand Line Emulator v1.0\n";
+}
+
+std::vector<Instruction> generateInstructions(int count, int depth=0) {
+    std::vector<Instruction> out;
+    static const std::vector<std::string> vars = {"x","y","z","a","b"};
+    for(int i=0;i<count;++i) {
+        int r = rand()%6;
+        if(r==0) {
+            // PRINT
+            out.push_back(Instruction(
+                Instruction::PRINT,
+                {},
+                {},
+                0
+            ));
+        }
+        else if(r==1) {
+
+            std::string v   = vars[rand()%vars.size()];
+            std::string val = std::to_string(rand()%100);
+            out.push_back(Instruction(
+                Instruction::DECLARE,
+                {v,val},
+                {},
+                0
+            ));
+        }
+        else if(r==2) {
+
+            out.push_back(Instruction(
+                Instruction::ADD,
+                {"x","y","z"},
+                {},
+                0
+            ));
+        }
+        else if(r==3) {
+
+            out.push_back(Instruction(
+                Instruction::SUBTRACT,
+                {"x","y","z"},
+                {},
+                0
+            ));
+        }
+        else if(r==4) {
+
+            std::string d = std::to_string(rand()%5+1);
+            out.push_back(Instruction(
+                Instruction::SLEEP,
+                {d},
+                {},
+                0
+            ));
+        }
+        else {
+
+            if(depth<3) {
+                int bodyLen = rand()%3 + 1;
+                auto body   = generateInstructions(bodyLen, depth+1);
+                unsigned reps = rand()%3 + 1;
+                out.push_back(Instruction(
+                    Instruction::FOR,
+                    {},
+                    std::move(body),
+                    reps
+                ));
+            } else {
+
+                out.push_back(Instruction(
+                    Instruction::PRINT,
+                    {},
+                    {},
+                    0
+                ));
+            }
+        }
+    }
+    return out;
+}
+
+void executeInstruction(Process *p, const Instruction &ins, int coreId) {
+
+    if(ins.type == Instruction::FOR) {
+        std::ostringstream log;
+        log << getCurrentTime()
+            << " Core:" << coreId
+            << " FOR " << ins.repeats
+            << " (body " << ins.body.size() << ")";
+        p->addLog(log.str());
+        for(unsigned r=0; r<ins.repeats; ++r)
+            for(auto &child: ins.body)
+                executeInstruction(p, child, coreId);
+        return;
+    }
+
+    std::ostringstream log;
+    log << getCurrentTime()
+        << " Core:" << coreId
+        << " [" << p->executedCommands << "] ";
+
+    switch(ins.type) {
+      case Instruction::PRINT:
+        log << "\"Hello world from " << p->name << "!\"";
+        break;
+      case Instruction::DECLARE: {
+        auto &vs = p->varStore;
+        uint16_t v = (uint16_t)std::stoi(ins.args[1]);
+        vs[ins.args[0]] = v;
+        log << "DECLARE " << ins.args[0] << " = " << v;
+        break;
+      }
+      case Instruction::ADD: {
+        auto &vs = p->varStore;
+        uint16_t y = vs[ins.args[1]], z = vs[ins.args[2]];
+        vs[ins.args[0]] = y+z;
+        log << "ADD " << ins.args[0]
+            << " = " << y << " + " << z;
+        break;
+      }
+      case Instruction::SUBTRACT: {
+        auto &vs = p->varStore;
+        uint16_t y = vs[ins.args[1]], z = vs[ins.args[2]];
+        vs[ins.args[0]] = y-z;
+        log << "SUBTRACT " << ins.args[0]
+            << " = " << y << " - " << z;
+        break;
+      }
+      case Instruction::SLEEP: {
+        int d = std::stoi(ins.args[0]);
+        log << "SLEEP for " << d << " ticks";
+        p->addLog(log.str());
+        std::this_thread::sleep_for(std::chrono::milliseconds(d*10));
+        ++p->executedCommands;
+        return;
+      }
+      default:
+        break;
+    }
+
+    p->addLog(log.str());
+    ++p->executedCommands;
+    std::this_thread::sleep_for(
+      std::chrono::milliseconds(10 + config.delays_per_exec));
+}
+
+void workerThread(int coreId) {
+    while(!exitFlag) {
+        Process *p=nullptr;
+        {
+            std::unique_lock<std::mutex> lk(queueMutex);
+            cv.wait(lk,[]{return !processQueue.empty()||exitFlag;});
+            if(exitFlag) break;
+            p = processQueue.front();
+            processQueue.pop();
+            coreStatus[coreId] = true;
+            p->core = coreId;
+        }
+        if(!p) continue;
+
+        if(config.scheduler=="rr") {
+            unsigned toRun = std::min(
+              config.quantum_cycles,
+              (unsigned)(p->totalCommands - p->executedCommands)
+            );
+            for(unsigned i=0;i<toRun;++i)
+                executeInstruction(p,
+                    p->instructions[p->executedCommands],
+                    coreId);
+
+            if(p->executedCommands>=p->totalCommands && !p->isFinished) {
+                p->isFinished=true;
+                std::lock_guard<std::mutex> g(finishedMutex);
+                finishedProcesses.push_back(p);
+            } else {
+                std::lock_guard<std::mutex> g(queueMutex);
+                processQueue.push(p);
+                cv.notify_one();
+            }
+        }
+        else {
+            while(p->executedCommands < p->totalCommands)
+                executeInstruction(p,
+                    p->instructions[p->executedCommands],
+                    coreId);
+            if(!p->isFinished) {
+                p->isFinished=true;
+                std::lock_guard<std::mutex> g(finishedMutex);
+                finishedProcesses.push_back(p);
+            }
+        }
+
+        coreStatus[coreId] = false;
+        cv.notify_all();
+    }
+}
+
+void schedulerThread() {
+    int id=0;
+    while(!exitFlag && schedulerRunning) {
+        std::string ts = getCurrentTime();
+        int cnt = config.min_ins +
+                  rand()%(config.max_ins - config.min_ins +1);
+        auto insts = generateInstructions(cnt);
+        auto *p = new Process(id++, ts, insts);
+
+        {
+            std::lock_guard<std::mutex> ql(queueMutex);
+            std::lock_guard<std::mutex> al(allMutex);
+            processQueue.push(p);
+            allProcesses.push_back(p);
+        }
+        cv.notify_one();
+        std::this_thread::sleep_for(
+          std::chrono::milliseconds(config.batch_process_freq*10));
+    }
+}
+
+void generateReport(std::ostream &out){
+    std::lock_guard<std::mutex> ql(queueMutex);
+    std::lock_guard<std::mutex> fl(finishedMutex);
+    std::lock_guard<std::mutex> al(allMutex);
+
+    int used = std::count(coreStatus.begin(),coreStatus.end(),true);
+    int tot  = (int)coreStatus.size();
+    float pct = tot? (float)used/tot*100.0f:0.0f;
+
+    out << "CPU Utilization: " << used << " / " << tot
+        << " cores used (" << std::fixed<<std::setprecision(2)
+        << pct << "%)\n\n";
+
+    out << "--- Running processes: ---\n";
+    for(auto*p: allProcesses)
+        if(!p->isFinished)
+            out << p->name<<" ("<<p->startTime<<") "
+                << "Core:"<<(p->core>=0?std::to_string(p->core):"N/A")<<" "
+                << p->executedCommands<<" / "<<p->totalCommands<<"\n";
+
+    out << "\n--- Finished processes: ---\n";
+    for(auto*p: finishedProcesses)
+        out << p->name<<" ("<<p->startTime<<") Finished "
+            << p->executedCommands<<" / "<<p->totalCommands<<"\n";
+    out << std::endl;
+}
+
+void displayScreen(){ generateReport(std::cout); }
+void saveUtilizationReport(){
+    std::ofstream f("csopesy-log.txt");
+    if(!f){ std::cout<<"Error: cannot write log\n"; return; }
+    f<<"CSOPESY Utilization Report - "<<getCurrentTime()<<"\n";
+    generateReport(f);
+    std::cout<<"Report saved to csopesy-log.txt\n";
+}
+
+void processScreen(Process* p){
+    system(CLEAR_COMMAND);
+    std::cout << "Process Screen: " << p->name << "\n"
+              << "Type 'process-smi' to view, 'exit' to return\n\n";
+
+    std::string cmd;
+    while(true){
+        std::cout << p->name << "> ";
+        if(!std::getline(std::cin,cmd)) break;
+
+        if(cmd=="exit"){
+            system(CLEAR_COMMAND);
+            printHeader();
+            return;
+        }
+        else if(cmd=="process-smi"){
+            std::cout
+              << "Name           : " << p->name              << "\n"
+              << "PID            : " << p->id                << "\n"
+              << "Assigned Core  : "
+                 << (p->core>=0?std::to_string(p->core):"N/A") << "\n"
+              << "Progress       : "
+                 << p->executedCommands << " / " << p->totalCommands << "\n"
+              << "Status         : "
+                 << (p->isFinished?"Finished":"Waiting")     << "\n\n";
+            for(auto &L: p->getLogs())
+                std::cout << L << "\n";
+            std::cout << "\n";
+        }
+        else {
+            std::cout << "Unknown—use 'process-smi' or 'exit'\n";
+        }
+    }
+}
+
+void readProcessLogs(Process* p){
+    system(CLEAR_COMMAND);
+    std::cout<<"=== Read-Only Logs: "<<p->name<<" ===\n\n";
+    for(auto &L: p->getLogs()) std::cout<<L<<"\n";
+    std::cout<<"\n(press ENTER)\n";
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(),'\n');
+    system(CLEAR_COMMAND);
+    printHeader();
+}
+
+bool readConfigFile(const std::string &fn){
+    std::ifstream f(fn);
+    if(!f) return false;
+    std::map<std::string,std::string> mp;
+    while(true){
+        std::string k,v;
+        if(!(f>>k>>v)) break;
+        mp[k]=v;
+    }
+    try {
+        if(mp.count("num-cpu")){
+            int x=std::stoi(mp["num-cpu"]);
+            if(x<1||x>128) throw 0;
+            config.num_cpu=x;
+        }
+        if(mp.count("scheduler")){
+            auto &s=mp["scheduler"];
+            if(s!="fcfs"&&s!="rr") throw 0;
+            config.scheduler=s;
+        }
+        if(mp.count("quantum-cycles"))     config.quantum_cycles     = std::stoul(mp["quantum-cycles"]);
+        if(mp.count("batch-process-freq")) config.batch_process_freq = std::stoul(mp["batch-process-freq"]);
+        if(mp.count("min-ins"))            config.min_ins            = std::stoul(mp["min-ins"]);
+        if(mp.count("max-ins"))            config.max_ins            = std::stoul(mp["max-ins"]);
+        if(mp.count("delays-per-exec"))    config.delays_per_exec    = std::stoul(mp["delays-per-exec"]);
+    } catch(...) {
+        return false;
+    }
+    return true;
+}
+
+void initializeSystem(){
+    if(initialized){
+        std::cout<<"Already initialized\n";
+        return;
+    }
+    if(!readConfigFile("config.txt"))
+        std::cout<<"Using default configuration\n";
+    coreStatus.assign(config.num_cpu,false);
+    initialized = true;
+    std::cout
+      << "System initialized:\n"
+      << " CPUs="<<config.num_cpu
+      << " sched="<<config.scheduler
+      << " quantum="<<config.quantum_cycles<<"\n"
+      << " batch-freq="<<config.batch_process_freq
+      << " min-ins="<<config.min_ins
+      << " max-ins="<<config.max_ins
+      << " delay="<<config.delays_per_exec<<"\n";
+}
+
+void processCommand(const std::string &cmd){
+    if(!initialized && cmd!="initialize" && cmd!="?"){
+        std::cout<<"Error: run 'initialize' first\n"; return;
+    }
+    if(cmd=="initialize") initializeSystem();
+    else if(cmd=="scheduler-start"){
+        if(!schedulerStarted.exchange(true)){
+            schedulerRunning = true;
+            for(int i=0;i<config.num_cpu;++i)
+                workerThreads.emplace_back(workerThread,i);
+            std::thread(schedulerThread).detach();
+            std::cout<<config.scheduler<<" scheduler started\n";
+        } else std::cout<<"Already running\n";
+    }
+    else if(cmd=="scheduler-stop"){
+        if(schedulerRunning.exchange(false)){
+            schedulerStarted = false;
+            std::cout<<"Scheduler stopped\n";
+        } else std::cout<<"Not running\n";
+    }
+    else if(cmd=="screen -ls") displayScreen();
+    else if(cmd.rfind("screen -s ",0)==0){
+        std::string n=cmd.substr(10);
+        std::lock_guard<std::mutex> g(allMutex);
+        auto it=std::find_if(allProcesses.begin(),allProcesses.end(),
+            [&](Process*p){return p->name==n;});
+        if(it!=allProcesses.end()) processScreen(*it);
+        else std::cout<<"Not found\n";
+    }
+    else if(cmd.rfind("screen -r ",0)==0){
+        std::string n=cmd.substr(10);
+        std::lock_guard<std::mutex> g(allMutex);
+        auto it=std::find_if(allProcesses.begin(),allProcesses.end(),
+            [&](Process*p){return p->name==n;});
+        if(it!=allProcesses.end()) readProcessLogs(*it);
+        else std::cout<<"Not found\n";
+    }
+    else if(cmd=="report-util") saveUtilizationReport();
+    else if(cmd=="clear"){ system(CLEAR_COMMAND); printHeader(); }
+    else if(cmd=="exit"){ exitFlag=true; cv.notify_all(); }
+    else if(cmd=="?"){
+        std::cout
+          << "Commands:\n"
+          << " initialize, scheduler-start, scheduler-stop,\n"
+          << " screen -ls, screen -s <name>, screen -r <name>,\n"
+          << " report-util, clear, exit, ?\n";
+    }
+    else {
+        std::cout<<"Unknown—type '?' for help\n";
+    }
+}
+
+int main(){
+    srand((unsigned)time(nullptr));
+    printHeader();
+    std::string line;
+    while(!exitFlag){
+        std::cout<<"CSOPESY> ";
+        if(!std::getline(std::cin,line)) break;
+        if(!line.empty()) processCommand(line);
+    }
+    for(auto &t: workerThreads) if(t.joinable()) t.join();
+    for(auto *p: allProcesses) delete p;
+    return 0;
+}
