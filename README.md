@@ -3,8 +3,11 @@
 **Process Multiplexer and CLI**
 
 Milan, John Lloyd - S22
+
 Quiambao, Mark Kobe - S22
+
 Medina, Lance Miguel - S22
+
 Villanueva, Ryan - S15
 
 ## Instructions
