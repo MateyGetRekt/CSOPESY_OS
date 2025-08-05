@@ -1,0 +1,24 @@
+initialize      Initialize scheduler
+                Syntax:
+                    initialize CORE SCHED
+                CORE  number of cores
+                SCHED choose one of the scheduler below:
+                    fcfs - First Come First Serve
+                    rr   - Round robin
+                    rr   - Round robin
+screen          Perform screen operations
+                Syntax:
+                    screen OPTION [NAME]
+                OPTION
+                    -s  create new screen
+                    -r  return to the NAME screen
+                    -ls list all processes and info
+                name    name of the screen
+scheduler-test  Start generating processes
+scheduler-stop  Stop generating processes
+report-util     Show processes and infos, and
+                write the output into a new
+                file
+process-smi     Generate Gantt chart of CPU
+exit            Exit the screen/program
+help            Show this help again

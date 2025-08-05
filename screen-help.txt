@@ -1,0 +1,3 @@
+process-smi     Generate Gantt chart of CPU
+exit            Exit the screen/program
+help            Show this help again
