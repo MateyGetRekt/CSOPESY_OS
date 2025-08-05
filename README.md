@@ -1,7 +1,3 @@
-Add a README.txt with your name and instructions on running your program. 
-Also, indicate the entry class file where the main function is located. 
-An alternative can be a GitHub link.
-
 CSOPESY S15 MO1&2: Operating System Emulator
 
 Members:
